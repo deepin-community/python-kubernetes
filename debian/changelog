@@ -1,0 +1,89 @@
+python-kubernetes (12.0.1-1) UNRELEASED; urgency=medium
+
+  * update
+
+ -- Debian Python Team <team+python@tracker.debian.org>  Fri, 17 Jun 2022 13:18:04 +0800
+
+python-kubernetes (12.0.1-1) unstable; urgency=medium
+
+  [ Ondřej Nový ]
+  * Bump Standards-Version to 4.4.1 .
+  * d/control: Update Maintainer field with new Debian Python Team
+    contact address.
+  * d/control: Update Vcs-* fields with new Debian Python Team Salsa
+    layout.
+
+  [ Debian Janitor ]
+  * Set upstream metadata fields: Bug-Database, Bug-Submit.
+  * Update standards version to 4.5.0, no changes needed.
+
+  [ Thomas Goirand ]
+  * New upstream release (Closes: #954381).
+    - Fixes FTBFS (Closes: #959621, #973072).
+  * Use git to generate upstream tarball, as the PyPi module doesn't include
+    the test folder. Using the gen-orig-xz in debian/rules, as using the
+    repack function of debian/watch doesn't make sense (why downloading a
+    tarball that would be later on discarded? I'm open to a better solution
+    which would be uscan compatible though...). Switch d/watch to the github
+    tag therefore.
+  * override_dh_auto_test to set PYTHONPATH.
+
+ -- Thomas Goirand <zigo@debian.org>  Fri, 20 Nov 2020 09:16:10 +0100
+
+python-kubernetes (7.0.0~a1-2) unstable; urgency=medium
+
+  * Team upload.
+  * Use debhelper-compat instead of debian/compat.
+  * Use Python 3 for building docs.
+  * Drop Python 2 support.
+  * Use pybuild for building package.
+  * Enable autopkgtest-pkg-python testsuite.
+  * Bump debhelper compat level to 12.
+  * Drop openstack-pkg-tools from B-D, not needed anymore.
+  * Bump standards version to 4.4.0 (no changes).
+
+ -- Ondřej Nový <onovy@debian.org>  Fri, 09 Aug 2019 12:06:14 +0200
+
+python-kubernetes (7.0.0~a1-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream version.
+    + ACTION REQUIRED: Rename the currently being-used async parameter to
+      async_req to support Python 3.7 because it's a reserved keyword now.
+
+ -- Christoph Berg <myon@debian.org>  Mon, 23 Jul 2018 19:55:52 +0200
+
+python-kubernetes (4.0.0-2) unstable; urgency=medium
+
+  * Uploading to unstable.
+
+ -- Thomas Goirand <zigo@debian.org>  Sun, 25 Feb 2018 22:56:31 +0000
+
+python-kubernetes (4.0.0-1) experimental; urgency=medium
+
+  [ Ondřej Nový ]
+  * d/control: Set Vcs-* to salsa.debian.org
+  * d/copyright: Use https in Format
+
+  [ Thomas Goirand ]
+  * New upstream release.
+  * Fixed (build-)depends for this release.
+  * Move the package to the DPMT:
+    - Update maintainer and uploader.
+    - Update VCS fields.
+    - Switched to pristine-tar.
+  * Standards-Version is now 4.1.3.
+
+ -- Thomas Goirand <zigo@debian.org>  Wed, 21 Feb 2018 10:33:23 +0100
+
+python-kubernetes (2.0.0-2) unstable; urgency=medium
+
+  * Uploading to unstable.
+
+ -- Thomas Goirand <zigo@debian.org>  Thu, 02 Nov 2017 01:04:30 +0000
+
+python-kubernetes (2.0.0-1) experimental; urgency=medium
+
+  * Initial release. (Closes: #879560)
+
+ -- Thomas Goirand <zigo@debian.org>  Sun, 22 Oct 2017 22:06:24 +0200

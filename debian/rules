@@ -1,0 +1,36 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME=kubernetes
+
+DEB_PKGNAME := $(shell dpkg-parsechangelog -SSource)
+DEB_VERSION := $(shell dpkg-parsechangelog -SVersion)
+DEB_NOEPOCH_VERSION := $(shell echo $(DEB_VERSION) | cut -d: -f2-)
+DEB_UPSTREAM_VERSION := $(shell echo $(DEB_NOEPOCH_VERSION) | sed 's/-[^-]*$$//')
+GIT_TAG := $(shell echo '$(DEB_UPSTREAM_VERSION)' | sed -e 's/~/_/')
+
+UPSTREAM_GIT = https://github.com/kubernetes-incubator/client-python
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	set -e ; set -x ; for pyvers in $$(py3versions -vr 2>/dev/null) ; do \
+		PYTHONPATH=$(CURDIR) python$${pyvers} -m pytest -v ; \
+	done
+
+gen-orig-xz:
+	set -e ; set -x ; \
+	cd .. ; \
+	git clone $(UPSTREAM_GIT) ; \
+	cd client-python ; \
+	git reset --hard v$(GIT_TAG) ; \
+	git tag $(GIT_TAG) v$(GIT_TAG) ; \
+	git archive --prefix=$(DEB_PKGNAME)-$(GIT_TAG)/ --format=tar $(GIT_TAG) >../$(DEB_PKGNAME)_$(GIT_TAG).orig.tar ; \
+	git submodule update --init ; \
+	cd kubernetes/base ; \
+	git archive  --prefix=$(DEB_PKGNAME)-$(GIT_TAG)/kubernetes/base/ --format=tar master > ../../../base.tar ; \
+	cd ../../.. ; \
+	tar -Af $(DEB_PKGNAME)_$(GIT_TAG).orig.tar base.tar ; \
+	rm -rf base.tar client-python ; \
+	cat $(DEB_PKGNAME)_$(GIT_TAG).orig.tar | xz >$(DEB_PKGNAME)_$(GIT_TAG).orig.tar.xz ; \
+	rm $(DEB_PKGNAME)_$(GIT_TAG).orig.tar
