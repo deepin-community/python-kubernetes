@@ -48,7 +48,7 @@ class Resource(object):
         self.extra_args = kwargs
 
     def to_dict(self):
-        return {
+        d = {
             '_type': 'Resource',
             'prefix': self.prefix,
             'group': self.group,
@@ -58,12 +58,13 @@ class Resource(object):
             'verbs': self.verbs,
             'name': self.name,
             'preferred': self.preferred,
-            'singular_name': self.singular_name,
-            'short_names': self.short_names,
+            'singularName': self.singular_name,
+            'shortNames': self.short_names,
             'categories': self.categories,
             'subresources': {k: sr.to_dict() for k, sr in self.subresources.items()},
-            'extra_args': self.extra_args,
         }
+        d.update(self.extra_args)
+        return d
 
     @property
     def group_version(self):
@@ -107,16 +108,20 @@ class Resource(object):
 class ResourceList(Resource):
     """ Represents a list of API objects """
 
-    def __init__(self, client, group='', api_version='v1', base_kind='', kind=None):
+    def __init__(self, client, group='', api_version='v1', base_kind='', kind=None, base_resource_lookup=None):
         self.client = client
         self.group = group
         self.api_version = api_version
         self.kind = kind or '{}List'.format(base_kind)
         self.base_kind = base_kind
+        self.base_resource_lookup = base_resource_lookup
         self.__base_resource = None
 
     def base_resource(self):
         if self.__base_resource:
+            return self.__base_resource
+        elif self.base_resource_lookup:
+            self.__base_resource = self.client.resources.get(**self.base_resource_lookup)
             return self.__base_resource
         elif self.base_kind:
             self.__base_resource = self.client.resources.get(group=self.group, api_version=self.api_version, kind=self.base_kind)
@@ -145,7 +150,7 @@ class ResourceList(Resource):
             raise ValueError('The `items` field in the body must be populated when calling methods on a ResourceList')
 
         if self.kind != kind:
-            raise ValueError('Methods on a {} must be called with a body containing the same kind. Receieved {} instead'.format(self.kind, kind))
+            raise ValueError('Methods on a {} must be called with a body containing the same kind. Received {} instead'.format(self.kind, kind))
 
         return {
             'api_version': api_version,
@@ -236,7 +241,7 @@ class Subresource(Resource):
         self.api_version = parent.api_version
         self.kind = kwargs.pop('kind')
         self.name = kwargs.pop('name')
-        self.subresource = self.name.split('/')[1]
+        self.subresource = kwargs.pop('subresource', None) or self.name.split('/')[1]
         self.namespaced = kwargs.pop('namespaced', False)
         self.verbs = kwargs.pop('verbs', None)
         self.extra_args = kwargs
@@ -262,14 +267,15 @@ class Subresource(Resource):
         return partial(getattr(self.parent.client, name), self)
 
     def to_dict(self):
-        return {
+        d = {
             'kind': self.kind,
             'name': self.name,
             'subresource': self.subresource,
             'namespaced': self.namespaced,
-            'verbs': self.verbs,
-            'extra_args': self.extra_args,
+            'verbs': self.verbs
         }
+        d.update(self.extra_args)
+        return d
 
 
 class ResourceInstance(object):
@@ -285,6 +291,8 @@ class ResourceInstance(object):
         kind = instance['kind']
         if kind.endswith('List') and 'items' in instance:
             kind = instance['kind'][:-4]
+            if not instance['items']:
+                instance['items'] = []
             for item in instance['items']:
                 if 'apiVersion' not in item:
                     item['apiVersion'] = instance['apiVersion']
@@ -296,7 +304,7 @@ class ResourceInstance(object):
 
     def __deserialize(self, field):
         if isinstance(field, dict):
-            return ResourceField(**{
+            return ResourceField(params={
                 k: self.__deserialize(v) for k, v in field.items()
             })
         elif isinstance(field, (list, tuple)):
@@ -357,8 +365,8 @@ class ResourceField(object):
         attributes to be accessed with '.' notation
     """
 
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+    def __init__(self, params):
+        self.__dict__.update(**params)
 
     def __repr__(self):
         return pformat(self.__dict__)
@@ -383,3 +391,15 @@ class ResourceField(object):
     def __iter__(self):
         for k, v in self.__dict__.items():
             yield (k, v)
+
+    def to_dict(self):
+        return self.__serialize(self)
+
+    def __serialize(self, field):
+        if isinstance(field, ResourceField):
+            return {
+                k: self.__serialize(v) for k, v in field.__dict__.items()
+            }
+        if isinstance(field, (list, tuple)):
+            return [self.__serialize(item) for item in field]
+        return field

@@ -13,19 +13,30 @@
 # under the License.
 
 import json
+import os
 import select
 import socket
 import time
 import unittest
 import uuid
+import six
+import io
+import gzip
 
 from kubernetes.client import api_client
 from kubernetes.client.api import core_v1_api
 from kubernetes.e2e_test import base
 from kubernetes.stream import stream, portforward
 from kubernetes.stream.ws_client import ERROR_CHANNEL
+from kubernetes.client.rest import ApiException
 
 import six.moves.urllib.request as urllib_request
+
+if six.PY3:
+    from http import HTTPStatus
+else:
+    import httplib
+
 
 def short_uuid():
     id = str(uuid.uuid4())
@@ -52,6 +63,7 @@ def manifest_with_command(name, command):
         }
     }
 
+
 class TestClient(unittest.TestCase):
 
     @classmethod
@@ -63,7 +75,30 @@ class TestClient(unittest.TestCase):
         api = core_v1_api.CoreV1Api(client)
 
         name = 'busybox-test-' + short_uuid()
-        pod_manifest = manifest_with_command(name, "while true;do date;sleep 5; done")
+        pod_manifest = manifest_with_command(
+            name, "while true;do date;sleep 5; done")
+
+        # wait for the default service account to be created
+        timeout = time.time() + 30
+        while True:
+            if time.time() > timeout:
+                print('timeout waiting for default service account creation')
+                break
+            try:
+                resp = api.read_namespaced_service_account(name='default',
+                                                           namespace='default')
+            except ApiException as e:
+                if (six.PY3 and e.status != HTTPStatus.NOT_FOUND) or (
+                        six.PY3 is False and e.status != httplib.NOT_FOUND):
+                    print('error: %s' % e)
+                    self.fail(
+                        msg="unexpected error getting default service account")
+                print('default service not found yet: %s' % e)
+                time.sleep(1)
+                continue
+            self.assertEqual('default', resp.metadata.name)
+            break
+
         resp = api.create_namespaced_pod(body=pod_manifest,
                                          namespace='default')
         self.assertEqual(name, resp.metadata.name)
@@ -82,25 +117,38 @@ class TestClient(unittest.TestCase):
                         '-c',
                         'for i in $(seq 1 3); do date; done']
         resp = stream(api.connect_get_namespaced_pod_exec, name, 'default',
-                                                   command=exec_command,
-                                                   stderr=False, stdin=False,
-                                                   stdout=True, tty=False)
-        print('EXEC response : %s' % resp)
+                      command=exec_command,
+                      stderr=False, stdin=False,
+                      stdout=True, tty=False)
+        print('EXEC response : %s (%s)' % (repr(resp), type(resp)))
+        self.assertIsInstance(resp, str)
         self.assertEqual(3, len(resp.splitlines()))
+
+        exec_command = ['/bin/sh',
+                        '-c',
+                        'echo -n "This is a test string" | gzip']
+        resp = stream(api.connect_get_namespaced_pod_exec, name, 'default',
+                      command=exec_command,
+                      stderr=False, stdin=False,
+                      stdout=True, tty=False,
+                      binary=True)
+        print('EXEC response : %s (%s)' % (repr(resp), type(resp)))
+        self.assertIsInstance(resp, bytes)
+        self.assertEqual("This is a test string", gzip.decompress(resp).decode('utf-8'))
 
         exec_command = 'uptime'
         resp = stream(api.connect_post_namespaced_pod_exec, name, 'default',
-                                                    command=exec_command,
-                                                    stderr=False, stdin=False,
-                                                    stdout=True, tty=False)
-        print('EXEC response : %s' % resp)
+                      command=exec_command,
+                      stderr=False, stdin=False,
+                      stdout=True, tty=False)
+        print('EXEC response : %s' % repr(resp))
         self.assertEqual(1, len(resp.splitlines()))
 
         resp = stream(api.connect_post_namespaced_pod_exec, name, 'default',
-                                                    command='/bin/sh',
-                                                    stderr=True, stdin=True,
-                                                    stdout=True, tty=False,
-                                                    _preload_content=False)
+                      command='/bin/sh',
+                      stderr=True, stdin=True,
+                      stdout=True, tty=False,
+                      _preload_content=False)
         resp.write_stdin("echo test string 1\n")
         line = resp.readline_stdout(timeout=5)
         self.assertFalse(resp.peek_stderr())
@@ -111,7 +159,37 @@ class TestClient(unittest.TestCase):
         self.assertEqual("test string 2", line)
         resp.write_stdin("exit\n")
         resp.update(timeout=5)
-        line = resp.read_channel(ERROR_CHANNEL)
+        while True:
+            line = resp.read_channel(ERROR_CHANNEL)
+            if line != '':
+                break
+            time.sleep(1)
+        status = json.loads(line)
+        self.assertEqual(status['status'], 'Success')
+        resp.update(timeout=5)
+        self.assertFalse(resp.is_open())
+
+        resp = stream(api.connect_post_namespaced_pod_exec, name, 'default',
+                      command='/bin/sh',
+                      stderr=True, stdin=True,
+                      stdout=True, tty=False,
+                      binary=True,
+                      _preload_content=False)
+        resp.write_stdin(b"echo test string 1\n")
+        line = resp.readline_stdout(timeout=5)
+        self.assertFalse(resp.peek_stderr())
+        self.assertEqual(b"test string 1", line)
+        resp.write_stdin(b"echo test string 2 >&2\n")
+        line = resp.readline_stderr(timeout=5)
+        self.assertFalse(resp.peek_stdout())
+        self.assertEqual(b"test string 2", line)
+        resp.write_stdin(b"exit\n")
+        resp.update(timeout=5)
+        while True:
+            line = resp.read_channel(ERROR_CHANNEL)
+            if len(line) != 0:
+                break
+            time.sleep(1)
         status = json.loads(line)
         self.assertEqual(status['status'], 'Success')
         resp.update(timeout=5)
@@ -128,7 +206,31 @@ class TestClient(unittest.TestCase):
         api = core_v1_api.CoreV1Api(client)
 
         name = 'busybox-test-' + short_uuid()
-        pod_manifest = manifest_with_command(name, "while true;do date;sleep 5; done")
+        pod_manifest = manifest_with_command(
+            name, "while true;do date;sleep 5; done")
+
+        # wait for the default service account to be created
+        timeout = time.time() + 30
+        while True:
+            if time.time() > timeout:
+                print('timeout waiting for default service account creation')
+                break
+
+            try:
+                resp = api.read_namespaced_service_account(name='default',
+                                                           namespace='default')
+            except ApiException as e:
+                if (six.PY3 and e.status != HTTPStatus.NOT_FOUND) or (
+                        six.PY3 is False and e.status != httplib.NOT_FOUND):
+                    print('error: %s' % e)
+                    self.fail(
+                        msg="unexpected error getting default service account")
+                print('default service not found yet: %s' % e)
+                time.sleep(1)
+                continue
+            self.assertEqual('default', resp.metadata.name)
+            break
+
         resp = api.create_namespaced_pod(body=pod_manifest,
                                          namespace='default')
         self.assertEqual(name, resp.metadata.name)
@@ -150,15 +252,21 @@ class TestClient(unittest.TestCase):
             (["/bin/sh", "-c", "ls /"], 0)
         )
         for command, value in commands_expected_values:
-            client = stream(api.connect_get_namespaced_pod_exec, name, 'default',
-                                                       command=command,
-                                                       stderr=True, stdin=False,
-                                                       stdout=True, tty=False,
-                                                       _preload_content=False)
+            client = stream(
+                api.connect_get_namespaced_pod_exec,
+                name,
+                'default',
+                command=command,
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _preload_content=False)
 
             self.assertIsNone(client.returncode)
             client.run_forever(timeout=10)
             self.assertEqual(client.returncode, value)
+            self.assertEqual(client.returncode, value)  # check idempotence
 
         resp = api.delete_namespaced_pod(name=name, body={},
                                          namespace='default')
@@ -167,98 +275,151 @@ class TestClient(unittest.TestCase):
         client = api_client.ApiClient(configuration=self.config)
         api = core_v1_api.CoreV1Api(client)
 
+        with open(os.path.join(os.path.dirname(__file__), 'port_server.py')) as fh:
+            port_server_py = fh.read()
         name = 'portforward-raw-' + short_uuid()
-        pod_manifest = manifest_with_command(
-            name,
-            ' '.join((
-                '((while true;do nc -l -p 1234 -e /bin/cat; done)&);',
-                '((while true;do nc -l -p 1235 -e /bin/cat; done)&);',
-                'sleep 60',
-            ))
+        resp = api.create_namespaced_config_map(
+            body={
+                'apiVersion': 'v1',
+                'kind': 'ConfigMap',
+                'metadata': {
+                    'name': name,
+                },
+                'data': {
+                    'port-server.py': port_server_py,
+                }
+            },
+            namespace='default',
         )
-        resp = api.create_namespaced_pod(body=pod_manifest,
-                                         namespace='default')
+        resp = api.create_namespaced_pod(
+            body={
+                'apiVersion': 'v1',
+                'kind': 'Pod',
+                'metadata': {
+                    'name': name
+                },
+                'spec': {
+                    'containers': [
+                        {
+                            'name': 'port-server',
+                            'image': 'python',
+                            'command': [
+                                'python', '-u', '/opt/port-server.py', '1234', '1235',
+                            ],
+                            'volumeMounts': [
+                                {
+                                    'name': 'port-server',
+                                    'mountPath': '/opt',
+                                    'readOnly': True,
+                                },
+                            ],
+                            'startupProbe': {
+                                'tcpSocket': {
+                                    'port': 1235,
+                                },
+                                'periodSeconds': 1,
+                                'failureThreshold': 30,
+                            },
+                        },
+                    ],
+                    'restartPolicy': 'Never',
+                    'volumes': [
+                        {
+                            'name': 'port-server',
+                            'configMap': {
+                                'name': name,
+                            },
+                        },
+                    ],
+                },
+            },
+            namespace='default',
+        )
         self.assertEqual(name, resp.metadata.name)
         self.assertTrue(resp.status.phase)
 
+        timeout = time.time() + 60
         while True:
             resp = api.read_namespaced_pod(name=name,
                                            namespace='default')
             self.assertEqual(name, resp.metadata.name)
-            self.assertTrue(resp.status.phase)
-            if resp.status.phase != 'Pending':
-                break
+            if resp.status.phase == 'Running':
+                if resp.status.container_statuses[0].ready:
+                    break
+            else:
+                self.assertEqual(resp.status.phase, 'Pending')
+            self.assertTrue(time.time() < timeout)
             time.sleep(1)
 
-        pf = portforward(api.connect_get_namespaced_pod_portforward,
-                         name, 'default',
-                         ports='1234,1235,1236')
-        self.assertTrue(pf.connected)
-        sock1234 = pf.socket(1234)
-        sock1235 = pf.socket(1235)
-        sock1234.setblocking(True)
-        sock1235.setblocking(True)
-        sent1234 = b'Test port 1234 forwarding...'
-        sent1235 = b'Test port 1235 forwarding...'
-        sock1234.sendall(sent1234)
-        sock1235.sendall(sent1235)
-        reply1234 = b''
-        reply1235 = b''
-        while True:
-            rlist = []
-            if sock1234.fileno() != -1:
-                rlist.append(sock1234)
-            if sock1235.fileno() != -1:
-                rlist.append(sock1235)
-            if not rlist:
-                break
-            r, _w, _x = select.select(rlist, [], [], 1)
-            if not r:
-                break
-            if sock1234 in r:
-                data = sock1234.recv(1024)
-                self.assertNotEqual(data, b'', "Unexpected socket close")
-                reply1234 += data
-            if sock1235 in r:
-                data = sock1235.recv(1024)
-                self.assertNotEqual(data, b'', "Unexpected socket close")
-                reply1235 += data
-        self.assertEqual(reply1234, sent1234)
-        self.assertEqual(reply1235, sent1235)
-        self.assertTrue(pf.connected)
-
-        sock = pf.socket(1236)
-        self.assertRaises(socket.error, sock.sendall, b'This should fail...')
-        self.assertIsNotNone(pf.error(1236))
-        sock.close()
-
-        for sock in (sock1234, sock1235):
+        for ix in range(10):
+            ix = str(ix + 1).encode()
+            pf = portforward(api.connect_get_namespaced_pod_portforward,
+                             name, 'default',
+                             ports='1234,1235,1236')
             self.assertTrue(pf.connected)
-            sent = b'Another test using fileno %s' % str(sock.fileno()).encode()
-            sock.sendall(sent)
-            reply = b''
-            while True:
-                r, _w, _x = select.select([sock], [], [], 1)
-                if not r:
-                    break
-                data = sock.recv(1024)
-                self.assertNotEqual(data, b'', "Unexpected socket close")
-                reply += data
-            self.assertEqual(reply, sent)
-            sock.close()
-        time.sleep(1)
-        self.assertFalse(pf.connected)
-        self.assertIsNone(pf.error(1234))
-        self.assertIsNone(pf.error(1235))
+            sock1234 = pf.socket(1234)
+            sock1235 = pf.socket(1235)
+            sock1234.setblocking(True)
+            sock1235.setblocking(True)
+            sent1234 = b'Test ' + ix + b' port 1234 forwarding'
+            sent1235 = b'Test ' + ix + b' port 1235 forwarding'
+            sock1234.sendall(sent1234)
+            sock1235.sendall(sent1235)
+            reply1234 = b''
+            reply1235 = b''
+            timeout = time.time() + 60
+            while reply1234 != sent1234 or reply1235 != sent1235:
+                self.assertNotEqual(sock1234.fileno(), -1)
+                self.assertNotEqual(sock1235.fileno(), -1)
+                self.assertTrue(time.time() < timeout)
+                r, _w, _x = select.select([sock1234, sock1235], [], [], 1)
+                if sock1234 in r:
+                    data = sock1234.recv(1024)
+                    self.assertNotEqual(data, b'', 'Unexpected socket close')
+                    reply1234 += data
+                    self.assertTrue(sent1234.startswith(reply1234))
+                if sock1235 in r:
+                    data = sock1235.recv(1024)
+                    self.assertNotEqual(data, b'', 'Unexpected socket close')
+                    reply1235 += data
+                    self.assertTrue(sent1235.startswith(reply1235))
+            self.assertTrue(pf.connected)
 
-        resp = api.delete_namespaced_pod(name=name, body={},
-                                         namespace='default')
+            sock = pf.socket(1236)
+            sock.setblocking(True)
+            self.assertEqual(sock.recv(1024), b'')
+            self.assertIsNotNone(pf.error(1236))
+            sock.close()
+
+            for sock in (sock1234, sock1235):
+                self.assertTrue(pf.connected)
+                sent = b'Another test ' + ix + b' using fileno ' + str(sock.fileno()).encode()
+                sock.sendall(sent)
+                reply = b''
+                timeout = time.time() + 60
+                while reply != sent:
+                    self.assertNotEqual(sock.fileno(), -1)
+                    self.assertTrue(time.time() < timeout)
+                    r, _w, _x = select.select([sock], [], [], 1)
+                    if r:
+                        data = sock.recv(1024)
+                        self.assertNotEqual(data, b'', 'Unexpected socket close')
+                        reply += data
+                        self.assertTrue(sent.startswith(reply))
+                sock.close()
+            time.sleep(1)
+            self.assertFalse(pf.connected)
+            self.assertIsNone(pf.error(1234))
+            self.assertIsNone(pf.error(1235))
+
+        resp = api.delete_namespaced_pod(name=name, namespace='default')
+        resp = api.delete_namespaced_config_map(name=name, namespace='default')
 
     def test_portforward_http(self):
         client = api_client.ApiClient(configuration=self.config)
         api = core_v1_api.CoreV1Api(client)
 
-        name = 'portforward-http-' +  short_uuid()
+        name = 'portforward-http-' + short_uuid()
         pod_manifest = {
             'apiVersion': 'v1',
             'kind': 'Pod',
@@ -301,7 +462,8 @@ class TestClient(unittest.TestCase):
         socket_create_connection = socket.create_connection
         try:
             socket.create_connection = kubernetes_create_connection
-            response = urllib_request.urlopen('http://%s.default.kubernetes/' % name)
+            response = urllib_request.urlopen(
+                'http://%s.default.kubernetes/' % name)
             html = response.read().decode('utf-8')
         finally:
             socket.create_connection = socket_create_connection
@@ -382,7 +544,7 @@ class TestClient(unittest.TestCase):
         self.assertEqual(2, resp.spec.replicas)
 
         resp = api.delete_namespaced_replication_controller(
-            name=name, body={}, namespace='default')
+            name=name, namespace='default', propagation_policy='Background')
 
     def test_configmap_apis(self):
         client = api_client.ApiClient(configuration=self.config)
@@ -394,6 +556,7 @@ class TestClient(unittest.TestCase):
             "apiVersion": "v1",
             "metadata": {
                 "name": name,
+                "labels": {"e2e-tests": "true"},
             },
             "data": {
                 "config.json": "{\"command\":\"/usr/bin/mysqld_safe\"}",
@@ -410,14 +573,28 @@ class TestClient(unittest.TestCase):
             name=name, namespace='default')
         self.assertEqual(name, resp.metadata.name)
 
-        test_configmap['data']['config.json'] = "{}"
+        json_patch_name = "json_patch_name"
+        json_patch_body = [{"op": "replace", "path": "/data",
+                            "value": {"new_value": json_patch_name}}]
         resp = api.patch_namespaced_config_map(
-            name=name, namespace='default', body=test_configmap)
+            name=name, namespace='default', body=json_patch_body)
+        self.assertEqual(json_patch_name, resp.data["new_value"])
+        self.assertEqual(None, resp.data.get("config.json"))
+        self.assertEqual(None, resp.data.get("frontend.cnf"))
+
+        merge_patch_name = "merge_patch_name"
+        merge_patch_body = {"data": {"new_value": merge_patch_name}}
+        resp = api.patch_namespaced_config_map(
+            name=name, namespace='default', body=merge_patch_body)
+        self.assertEqual(merge_patch_name, resp.data["new_value"])
+        self.assertEqual(None, resp.data.get("config.json"))
+        self.assertEqual(None, resp.data.get("frontend.cnf"))
 
         resp = api.delete_namespaced_config_map(
             name=name, body={}, namespace='default')
 
-        resp = api.list_namespaced_config_map('default', pretty=True)
+        resp = api.list_namespaced_config_map(
+            'default', pretty=True, label_selector="e2e-tests=true")
         self.assertEqual([], resp.items)
 
     def test_node_apis(self):

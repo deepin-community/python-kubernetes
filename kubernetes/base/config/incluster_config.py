@@ -70,13 +70,13 @@ class InClusterConfigLoader(object):
                                      self._environ[SERVICE_PORT_ENV_NAME]))
 
         if not os.path.isfile(self._token_filename):
-            raise ConfigException("Service token file does not exists.")
+            raise ConfigException("Service token file does not exist.")
 
         self._read_token_file()
 
         if not os.path.isfile(self._cert_filename):
             raise ConfigException(
-                "Service certification file does not exists.")
+                "Service certification file does not exist.")
 
         with open(self._cert_filename) as f:
             if not f.read():
@@ -92,12 +92,12 @@ class InClusterConfigLoader(object):
         if not self._try_refresh_token:
             return
 
-        def load_token_from_file(*args):
+        def _refresh_api_key(client_configuration):
             if self.token_expires_at <= datetime.datetime.now():
                 self._read_token_file()
-            return self.token
+            self._set_config(client_configuration)
 
-        client_configuration.get_api_key_with_prefix = load_token_from_file
+        client_configuration.refresh_api_key_hook = _refresh_api_key
 
     def _read_token_file(self):
         with open(self._token_filename) as f:

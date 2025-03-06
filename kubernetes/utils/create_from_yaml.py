@@ -14,16 +14,90 @@
 
 
 import re
-from os import path
+import os
 
 import yaml
 
 from kubernetes import client
 
+UPPER_FOLLOWED_BY_LOWER_RE = re.compile('(.)([A-Z][a-z]+)')
+LOWER_OR_NUM_FOLLOWED_BY_UPPER_RE = re.compile('([a-z0-9])([A-Z])')
+
+
+def create_from_directory(
+        k8s_client,
+        yaml_dir=None,
+        verbose=False,
+        namespace="default",
+        **kwargs):
+    """
+    Perform an action from files from a directory. Pass True for verbose to
+    print confirmation information.
+
+    Input:
+    k8s_client: an ApiClient object, initialized with the client args.
+    yaml_dir: string. Contains the path to directory.
+    verbose: If True, print confirmation from the create action.
+        Default is False.
+    namespace: string. Contains the namespace to create all
+        resources inside. The namespace must preexist otherwise
+        the resource creation will fail. If the API object in
+        the yaml file already contains a namespace definition
+        this parameter has no effect.
+
+    Available parameters for creating <kind>:
+    :param async_req bool
+    :param bool include_uninitialized: If true, partially initialized
+        resources are included in the response.
+    :param str pretty: If 'true', then the output is pretty printed.
+    :param str dry_run: When present, indicates that modifications
+        should not be persisted. An invalid or unrecognized dryRun
+        directive will result in an error response and no further
+        processing of the request.
+        Valid values are: - All: all dry run stages will be processed
+
+    Returns:
+        The list containing the created kubernetes API objects.
+
+    Raises:
+        FailToCreateError which holds list of `client.rest.ApiException`
+        instances for each object that failed to create.
+    """
+
+    if not yaml_dir:
+        raise ValueError(
+            '`yaml_dir` argument must be provided')
+    elif not os.path.isdir(yaml_dir):
+        raise ValueError(
+            '`yaml_dir` argument must be a path to directory')
+
+    files = [os.path.join(yaml_dir, i) for i in os.listdir(yaml_dir)
+             if os.path.isfile(os.path.join(yaml_dir, i))]
+    if not files:
+        raise ValueError(
+            '`yaml_dir` contains no files')
+
+    failures = []
+    k8s_objects_all = []
+
+    for file in files:
+        try:
+            k8s_objects = create_from_yaml(k8s_client, file,
+                                           verbose=verbose,
+                                           namespace=namespace,
+                                           **kwargs)
+            k8s_objects_all.append(k8s_objects)
+        except FailToCreateError as failure:
+            failures.extend(failure.api_exceptions)
+    if failures:
+        raise FailToCreateError(failures)
+    return k8s_objects_all
+
 
 def create_from_yaml(
         k8s_client,
-        yaml_file,
+        yaml_file=None,
+        yaml_objects=None,
         verbose=False,
         namespace="default",
         **kwargs):
@@ -33,6 +107,8 @@ def create_from_yaml(
     Input:
     yaml_file: string. Contains the path to yaml file.
     k8s_client: an ApiClient object, initialized with the client args.
+    yaml_objects: List[dict]. Optional list of YAML objects; used instead
+        of reading the `yaml_file`. Default is None.
     verbose: If True, print confirmation from the create action.
         Default is False.
     namespace: string. Contains the namespace to create all
@@ -59,12 +135,13 @@ def create_from_yaml(
         FailToCreateError which holds list of `client.rest.ApiException`
         instances for each object that failed to create.
     """
-    with open(path.abspath(yaml_file)) as f:
-        yml_document_all = yaml.safe_load_all(f)
 
+    def create_with(objects):
         failures = []
         k8s_objects = []
-        for yml_document in yml_document_all:
+        for yml_document in objects:
+            if yml_document is None:
+                continue
             try:
                 created = create_from_dict(k8s_client, yml_document, verbose,
                                            namespace=namespace,
@@ -74,8 +151,23 @@ def create_from_yaml(
                 failures.extend(failure.api_exceptions)
         if failures:
             raise FailToCreateError(failures)
-
         return k8s_objects
+
+    class Loader(yaml.loader.SafeLoader):
+        yaml_implicit_resolvers = yaml.loader.SafeLoader.yaml_implicit_resolvers.copy()
+        if "=" in yaml_implicit_resolvers:
+            yaml_implicit_resolvers.pop("=")
+
+    if yaml_objects:
+        yml_document_all = yaml_objects
+        return create_with(yml_document_all)
+    elif yaml_file:
+        with open(os.path.abspath(yaml_file)) as f:
+            yml_document_all = yaml.load_all(f, Loader=Loader)
+            return create_with(yml_document_all)
+    else:
+        raise ValueError(
+            'One of `yaml_file` or `yaml_objects` arguments must be provided')
 
 
 def create_from_dict(k8s_client, data, verbose=False, namespace='default',
@@ -155,8 +247,8 @@ def create_from_yaml_single_item(
     k8s_api = getattr(client, fcn_to_call)(k8s_client)
     # Replace CamelCased action_type into snake_case
     kind = yml_object["kind"]
-    kind = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', kind)
-    kind = re.sub('([a-z0-9])([A-Z])', r'\1_\2', kind).lower()
+    kind = UPPER_FOLLOWED_BY_LOWER_RE.sub(r'\1_\2', kind)
+    kind = LOWER_OR_NUM_FOLLOWED_BY_UPPER_RE.sub(r'\1_\2', kind).lower()
     # Expect the user to create namespaced objects more often
     if hasattr(k8s_api, "create_namespaced_{0}".format(kind)):
         # Decide which namespace we are going to put the object in,

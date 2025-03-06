@@ -31,7 +31,7 @@ class ExecProvider(object):
     * caching
     """
 
-    def __init__(self, exec_config):
+    def __init__(self, exec_config, cwd):
         """
         exec_config must be of type ConfigNode because we depend on
         safe_get(self, key) to correctly handle optional exec provider
@@ -54,12 +54,15 @@ class ExecProvider(object):
                 additional_vars[name] = value
             self.env.update(additional_vars)
 
+        self.cwd = cwd or None
+
     def run(self, previous_response=None):
+        is_interactive = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
         kubernetes_exec_info = {
             'apiVersion': self.api_version,
             'kind': 'ExecCredential',
             'spec': {
-                'interactive': sys.stdout.isatty()
+                'interactive': is_interactive
             }
         }
         if previous_response:
@@ -68,7 +71,9 @@ class ExecProvider(object):
         process = subprocess.Popen(
             self.args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=sys.stderr if is_interactive else subprocess.PIPE,
+            stdin=sys.stdin if is_interactive else None,
+            cwd=self.cwd,
             env=self.env,
             universal_newlines=True)
         (stdout, stderr) = process.communicate()

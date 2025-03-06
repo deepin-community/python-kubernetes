@@ -52,20 +52,33 @@ def _find_return_type(func):
 
 
 def iter_resp_lines(resp):
-    prev = ""
-    for seg in resp.read_chunked(decode_content=False):
-        if isinstance(seg, bytes):
-            seg = seg.decode('utf8')
-        seg = prev + seg
-        lines = seg.split("\n")
-        if not seg.endswith("\n"):
-            prev = lines[-1]
-            lines = lines[:-1]
+    buffer = bytearray()
+    for segment in resp.stream(amt=None, decode_content=False):
+
+        # Append the segment (chunk) to the buffer
+        #
+        # Performance note: depending on contents of buffer and the type+value of segment,
+        # encoding segment into the buffer could be a wasteful step. The approach used here
+        # simplifies the logic farther down, but in the future it may be reasonable to
+        # sacrifice readability for performance.
+        if isinstance(segment, bytes):
+            buffer.extend(segment)
+        elif isinstance(segment, str):
+            buffer.extend(segment.encode("utf-8"))
         else:
-            prev = ""
-        for line in lines:
+            raise TypeError(
+                f"Received invalid segment type, {type(segment)}, from stream. Accepts only 'str' or 'bytes'.")
+
+        # Split by newline (safe for utf-8 because multi-byte sequences cannot contain the newline byte)
+        next_newline = buffer.find(b'\n')
+        while next_newline != -1:
+            # Convert bytes to a valid utf-8 string, replacing any invalid utf-8 with the '�' character
+            line = buffer[:next_newline].decode(
+                "utf-8", errors="replace")
+            buffer = buffer[next_newline+1:]
             if line:
                 yield line
+            next_newline = buffer.find(b'\n')
 
 
 class Watch(object):
@@ -96,7 +109,11 @@ class Watch(object):
     def unmarshal_event(self, data, return_type):
         js = json.loads(data)
         js['raw_object'] = js['object']
-        if return_type and js['type'] != 'ERROR':
+        # BOOKMARK event is treated the same as ERROR for a quick fix of
+        # decoding exception
+        # TODO: make use of the resource_version in BOOKMARK event for more
+        # efficient WATCH
+        if return_type and js['type'] != 'ERROR' and js['type'] != 'BOOKMARK':
             obj = SimpleNamespace(data=json.dumps(js['raw_object']))
             js['object'] = self._api_client.deserialize(obj, return_type)
             if hasattr(js['object'], 'metadata'):
@@ -151,7 +168,9 @@ class Watch(object):
         if 'resource_version' in kwargs:
             self.resource_version = kwargs['resource_version']
 
-        timeouts = ('timeout_seconds' in kwargs)
+        # Do not attempt retries if user specifies a timeout.
+        # We want to ensure we are returning within that timeout.
+        disable_retries = ('timeout_seconds' in kwargs)
         retry_after_410 = False
         while True:
             resp = func(*args, **kwargs)
@@ -164,9 +183,9 @@ class Watch(object):
                         if isinstance(event, dict) \
                                 and event['type'] == 'ERROR':
                             obj = event['raw_object']
-                            # Current request expired, let's retry,
+                            # Current request expired, let's retry, (if enabled)
                             # but only if we have not already retried.
-                            if not retry_after_410 and \
+                            if not disable_retries and not retry_after_410 and \
                                     obj['code'] == HTTP_STATUS_GONE:
                                 retry_after_410 = True
                                 break
@@ -190,5 +209,5 @@ class Watch(object):
                 else:
                     self._stop = True
 
-            if timeouts or self._stop:
+            if self._stop or disable_retries:
                 break

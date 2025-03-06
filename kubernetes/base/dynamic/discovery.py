@@ -15,8 +15,10 @@
 import os
 import six
 import json
+import logging
 import hashlib
 import tempfile
+from functools import partial
 from collections import defaultdict
 from abc import abstractmethod, abstractproperty
 
@@ -43,7 +45,11 @@ class Discoverer(object):
         default_cache_id = self.client.configuration.host
         if six.PY3:
             default_cache_id = default_cache_id.encode('utf-8')
-        default_cachefile_name = 'osrcp-{0}.json'.format(hashlib.md5(default_cache_id).hexdigest())
+        try:
+            default_cachefile_name = 'osrcp-{0}.json'.format(hashlib.md5(default_cache_id, usedforsecurity=False).hexdigest())
+        except TypeError:
+            # usedforsecurity is only supported in 3.9+
+            default_cachefile_name = 'osrcp-{0}.json'.format(hashlib.md5(default_cache_id).hexdigest())
         self.__cache_file = cache_file or os.path.join(tempfile.gettempdir(), default_cachefile_name)
         self.__init_cache()
 
@@ -54,11 +60,12 @@ class Discoverer(object):
         else:
             try:
                 with open(self.__cache_file, 'r') as f:
-                    self._cache = json.load(f, cls=CacheDecoder(self.client))
+                    self._cache = json.load(f, cls=partial(CacheDecoder, self.client))
                 if self._cache.get('library_version') != __version__:
                     # Version mismatch, need to refresh cache
                     self.invalidate_cache()
-            except Exception:
+            except Exception as e:
+                logging.error("load cache error: %s", e)
                 self.invalidate_cache()
         self._load_server_info()
         self.discover()
@@ -163,7 +170,7 @@ class Discoverer(object):
         resources_raw = list(filter(lambda resource: '/' not in resource['name'], resources_response))
         subresources_raw = list(filter(lambda resource: '/' in resource['name'], resources_response))
         for subresource in subresources_raw:
-            resource, name = subresource['name'].split('/')
+            resource, name = subresource['name'].split('/', 1)
             if not subresources.get(resource):
                 subresources[resource] = {}
             subresources[resource][name] = subresource
@@ -234,7 +241,11 @@ class LazyDiscoverer(Discoverer):
         return self.parse_api_groups(request_resources=False, update=True)['apis'].keys()
 
     def search(self, **kwargs):
-        results = self.__search(self.__build_search(**kwargs), self.__resources, [])
+        # In first call, ignore ResourceNotFoundError and set default value for results
+        try:
+            results = self.__search(self.__build_search(**kwargs), self.__resources, [])
+        except ResourceNotFoundError:
+            results = []
         if not results:
             self.invalidate_cache()
             results = self.__search(self.__build_search(**kwargs), self.__resources, [])
