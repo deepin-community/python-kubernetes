@@ -5,8 +5,8 @@ Maintainer: Debian Python Team <team+python@tracker.debian.org>
 Uploaders:
  Thomas Goirand <zigo@debian.org>,
 Build-Depends:
- debhelper-compat (= 12),
- dh-python,
+ debhelper-compat (= 13),
+ dh-sequence-python3,
  python3-sphinx,
  python3-all,
  python3-setuptools,
@@ -14,20 +14,18 @@ Build-Depends-Indep:
  python3-certifi,
  python3-dateutil,
  python3-google-auth,
- python3-mock,
- python3-nose,
  python3-pluggy,
  python3-py,
  python3-pytest,
- python3-randomize,
  python3-recommonmark,
  python3-requests,
  python3-requests-oauthlib,
  python3-six,
  python3-urllib3,
  python3-websocket,
- python3-yaml,
-Standards-Version: 4.5.0
+ python3-yaml (>= 5.4.1),
+Rules-Requires-Root: no
+Standards-Version: 4.6.0
 Vcs-Browser: https://salsa.debian.org/python-team/packages/python-kubernetes
 Vcs-Git: https://salsa.debian.org/python-team/packages/python-kubernetes.git
 Homepage: https://github.com/kubernetes-incubator/client-python
@@ -41,11 +39,10 @@ Depends:
  python3-google-auth,
  python3-requests,
  python3-requests-oauthlib,
- python3-setuptools,
  python3-six,
  python3-urllib3,
  python3-websocket,
- python3-yaml,
+ python3-yaml (>= 5.4.1),
  ${misc:Depends},
  ${python3:Depends},
 Description: Kubernetes Python client - Python 3.x

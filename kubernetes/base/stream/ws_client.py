@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 
 from kubernetes.client.rest import ApiException, ApiValueError
 
@@ -25,10 +26,13 @@ import time
 import six
 import yaml
 
+
 from six.moves.urllib.parse import urlencode, urlparse, urlunparse
-from six import StringIO
+from six import StringIO, BytesIO
 
 from websocket import WebSocket, ABNF, enableTrace
+from base64 import urlsafe_b64decode
+from requests.utils import should_bypass_proxies
 
 STDIN_CHANNEL = 0
 STDOUT_CHANNEL = 1
@@ -45,7 +49,7 @@ class _IgnoredIO:
 
 
 class WSClient:
-    def __init__(self, configuration, url, headers, capture_all):
+    def __init__(self, configuration, url, headers, capture_all, binary=False):
         """A websocket client with support for channels.
 
             Exec command uses different channels for different streams. for
@@ -55,12 +59,15 @@ class WSClient:
         """
         self._connected = False
         self._channels = {}
+        self.binary = binary
+        self.newline = '\n' if not self.binary else b'\n'
         if capture_all:
-            self._all = StringIO()
+            self._all = StringIO() if not self.binary else BytesIO()
         else:
             self._all = _IgnoredIO()
         self.sock = create_websocket(configuration, url, headers)
         self._connected = True
+        self._returncode = None
 
     def peek_channel(self, channel, timeout=0):
         """Peek a channel and return part of the input,
@@ -88,8 +95,8 @@ class WSClient:
         while self.is_open() and time.time() - start < timeout:
             if channel in self._channels:
                 data = self._channels[channel]
-                if "\n" in data:
-                    index = data.find("\n")
+                if self.newline in data:
+                    index = data.find(self.newline)
                     ret = data[:index]
                     data = data[index+1:]
                     if data:
@@ -165,8 +172,27 @@ class WSClient:
         if not self.sock.connected:
             self._connected = False
             return
-        r, _, _ = select.select(
-            (self.sock.sock, ), (), (), timeout)
+
+        # The options here are:
+        # select.select() - this will work on most OS, however, it has a
+        #                   limitation of only able to read fd numbers up to 1024.
+        #                   i.e. does not scale well. This was the original
+        #                   implementation.
+        # select.poll()   - this will work on most unix based OS, but not as
+        #                   efficient as epoll. Will work for fd numbers above 1024.
+        # select.epoll()  - newest and most efficient way of polling.
+        #                   However, only works on linux.
+        if hasattr(select, "poll"):
+            poll = select.poll()
+            poll.register(self.sock.sock, select.POLLIN)
+            if timeout is not None:
+                timeout *= 1_000  # poll method uses milliseconds as the time unit
+            r = poll.poll(timeout)
+            poll.unregister(self.sock.sock)
+        else:
+            r, _, _ = select.select(
+                (self.sock.sock, ), (), (), timeout)
+
         if r:
             op_code, frame = self.sock.recv_data_frame(True)
             if op_code == ABNF.OPCODE_CLOSE:
@@ -174,10 +200,12 @@ class WSClient:
                 return
             elif op_code == ABNF.OPCODE_BINARY or op_code == ABNF.OPCODE_TEXT:
                 data = frame.data
-                if six.PY3:
+                if six.PY3 and not self.binary:
                     data = data.decode("utf-8", "replace")
                 if len(data) > 1:
-                    channel = ord(data[0])
+                    channel = data[0]
+                    if six.PY3 and not self.binary:
+                        channel = ord(channel)
                     data = data[1:]
                     if data:
                         if channel in [STDOUT_CHANNEL, STDERR_CHANNEL]:
@@ -208,12 +236,14 @@ class WSClient:
         if self.is_open():
             return None
         else:
-            err = self.read_channel(ERROR_CHANNEL)
-            err = yaml.safe_load(err)
-            if err['status'] == "Success":
-                return 0
-            return int(err['details']['causes'][0]['message'])
-
+            if self._returncode is None:
+                err = self.read_channel(ERROR_CHANNEL)
+                err = yaml.safe_load(err)
+                if err['status'] == "Success":
+                    self._returncode = 0
+                else:
+                    self._returncode = int(err['details']['causes'][0]['message'])
+            return self._returncode
 
     def close(self, **kwargs):
         """
@@ -233,7 +263,7 @@ class PortForward:
 
         Port Forward command sends on 2 channels per port, a read/write
         data channel and a read only error channel. Both channels are sent an
-        initial frame contaning the port number that channel is associated with.
+        initial frame containing the port number that channel is associated with.
         """
 
         self.websocket = websocket
@@ -278,7 +308,7 @@ class PortForward:
             # between the python application and the kubernetes websocket. The self.python
             # half of the socket pair is used by the _proxy method to receive and send data
             # to the running python application.
-            s, self.python = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            s, self.python = socket.socketpair()
             # The self.socket half of the pair is used by the python application to send
             # and receive data to the eventual pod port. It is wrapped in the _Socket class
             # because a socket pair is an AF_UNIX socket, not a AF_INET socket. This allows
@@ -330,69 +360,76 @@ class PortForward:
             local_all_closed = True
             for port in self.local_ports.values():
                 if port.python.fileno() != -1:
-                    if port.error or not self.websocket.connected:
+                    if self.websocket.connected:
+                        rlist.append(port.python)
+                        if port.data:
+                            wlist.append(port.python)
+                        local_all_closed = False
+                    else:
                         if port.data:
                             wlist.append(port.python)
                             local_all_closed = False
                         else:
                             port.python.close()
-                    else:
-                        rlist.append(port.python)
-                        if port.data:
-                            wlist.append(port.python)
-                        local_all_closed = False
             if local_all_closed and not (self.websocket.connected and kubernetes_data):
                 self.websocket.close()
                 return
             r, w, _ = select.select(rlist, wlist, [])
             for sock in r:
                 if sock == self.websocket:
-                    opcode, frame = self.websocket.recv_data_frame(True)
-                    if opcode == ABNF.OPCODE_BINARY:
-                        if not frame.data:
-                            raise RuntimeError("Unexpected frame data size")
-                        channel = six.byte2int(frame.data)
-                        if channel >= len(channel_ports):
-                            raise RuntimeError("Unexpected channel number: %s" % channel)
-                        port = channel_ports[channel]
-                        if channel_initialized[channel]:
-                            if channel % 2:
-                                if port.error is None:
-                                    port.error = ''
-                                port.error += frame.data[1:].decode()
+                    pending = True
+                    while pending:
+                        opcode, frame = self.websocket.recv_data_frame(True)
+                        if opcode == ABNF.OPCODE_BINARY:
+                            if not frame.data:
+                                raise RuntimeError("Unexpected frame data size")
+                            channel = six.byte2int(frame.data)
+                            if channel >= len(channel_ports):
+                                raise RuntimeError("Unexpected channel number: %s" % channel)
+                            port = channel_ports[channel]
+                            if channel_initialized[channel]:
+                                if channel % 2:
+                                    if port.error is None:
+                                        port.error = ''
+                                    port.error += frame.data[1:].decode()
+                                    port.python.close()
+                                else:
+                                    port.data += frame.data[1:]
                             else:
-                                port.data += frame.data[1:]
-                        else:
-                            if len(frame.data) != 3:
-                                raise RuntimeError(
-                                    "Unexpected initial channel frame data size"
-                                )
-                            port_number = six.byte2int(frame.data[1:2]) + (six.byte2int(frame.data[2:3]) * 256)
-                            if port_number != port.port_number:
-                                raise RuntimeError(
-                                    "Unexpected port number in initial channel frame: %s" % port_number
-                                )
-                            channel_initialized[channel] = True
-                    elif opcode not in (ABNF.OPCODE_PING, ABNF.OPCODE_PONG, ABNF.OPCODE_CLOSE):
-                        raise RuntimeError("Unexpected websocket opcode: %s" % opcode)
+                                if len(frame.data) != 3:
+                                    raise RuntimeError(
+                                        "Unexpected initial channel frame data size"
+                                    )
+                                port_number = six.byte2int(frame.data[1:2]) + (six.byte2int(frame.data[2:3]) * 256)
+                                if port_number != port.port_number:
+                                    raise RuntimeError(
+                                        "Unexpected port number in initial channel frame: %s" % port_number
+                                    )
+                                channel_initialized[channel] = True
+                        elif opcode not in (ABNF.OPCODE_PING, ABNF.OPCODE_PONG, ABNF.OPCODE_CLOSE):
+                            raise RuntimeError("Unexpected websocket opcode: %s" % opcode)
+                        if not (isinstance(self.websocket.sock, ssl.SSLSocket) and self.websocket.sock.pending()):
+                            pending = False
                 else:
                     port = local_ports[sock]
-                    data = port.python.recv(1024 * 1024)
-                    if data:
-                        kubernetes_data += ABNF.create_frame(
-                            port.channel + data,
-                            ABNF.OPCODE_BINARY,
-                        ).format()
-                    else:
-                        port.python.close()
+                    if port.python.fileno() != -1:
+                        data = port.python.recv(1024 * 1024)
+                        if data:
+                            kubernetes_data += ABNF.create_frame(
+                                port.channel + data,
+                                ABNF.OPCODE_BINARY,
+                            ).format()
+                        else:
+                            port.python.close()
             for sock in w:
                 if sock == self.websocket:
                     sent = self.websocket.sock.send(kubernetes_data)
                     kubernetes_data = kubernetes_data[sent:]
                 else:
                     port = local_ports[sock]
-                    sent = port.python.send(port.data)
-                    port.data = port.data[sent:]
+                    if port.python.fileno() != -1:
+                        sent = port.python.send(port.data)
+                        port.data = port.data[sent:]
 
 
 def get_websocket_url(url, query_params=None):
@@ -443,14 +480,37 @@ def create_websocket(configuration, url, headers=None):
         ssl_opts['certfile'] = configuration.cert_file
     if configuration.key_file:
         ssl_opts['keyfile'] = configuration.key_file
+    if configuration.tls_server_name:
+        ssl_opts['server_hostname'] = configuration.tls_server_name
 
     websocket = WebSocket(sslopt=ssl_opts, skip_utf8_validation=False)
+    connect_opt = {
+         'header': header
+    }
+
+    if configuration.proxy or configuration.proxy_headers:
+        connect_opt = websocket_proxycare(connect_opt, configuration, url, headers)
+
+    websocket.connect(url, **connect_opt)
+    return websocket
+
+def websocket_proxycare(connect_opt, configuration, url, headers):
+    """ An internal function to be called in api-client when a websocket
+        create is requested.
+    """
+    if configuration.no_proxy:
+        connect_opt.update({ 'http_no_proxy': configuration.no_proxy.split(',') })
+
     if configuration.proxy:
         proxy_url = urlparse(configuration.proxy)
-        websocket.connect(url, header=header, http_proxy_host=proxy_url.hostname, http_proxy_port=proxy_url.port)
-    else:
-        websocket.connect(url, header=header)
-    return websocket
+        connect_opt.update({'http_proxy_host': proxy_url.hostname, 'http_proxy_port': proxy_url.port})
+    if configuration.proxy_headers:
+        for key,value in configuration.proxy_headers.items():
+            if key == 'proxy-authorization' and value.startswith('Basic'):
+                b64value = value.split()[1]
+                auth = urlsafe_b64decode(b64value).decode().split(':')
+                connect_opt.update({'http_proxy_auth': (auth[0], auth[1]) })
+    return(connect_opt)
 
 
 def websocket_call(configuration, _method, url, **kwargs):
@@ -463,13 +523,17 @@ def websocket_call(configuration, _method, url, **kwargs):
     _request_timeout = kwargs.get("_request_timeout", 60)
     _preload_content = kwargs.get("_preload_content", True)
     capture_all = kwargs.get("capture_all", True)
-
+    binary = kwargs.get('binary', False)
     try:
-        client = WSClient(configuration, url, headers, capture_all)
+        client = WSClient(configuration, url, headers, capture_all, binary=binary)
         if not _preload_content:
             return client
         client.run_forever(timeout=_request_timeout)
-        return WSResponse('%s' % ''.join(client.read_all()))
+        all = client.read_all()
+        if binary:
+            return WSResponse(all)
+        else:
+            return WSResponse('%s' % ''.join(all))
     except (Exception, KeyboardInterrupt, SystemExit) as e:
         raise ApiException(status=0, reason=str(e))
 

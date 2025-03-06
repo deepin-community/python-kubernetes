@@ -1,13 +1,71 @@
-python-kubernetes (12.0.1-1) UNRELEASED; urgency=medium
+python-kubernetes (30.1.0-2) unstable; urgency=medium
 
-  * update
+  * Team upload.
+  * Remove runtime dependency on python3-setuptools
 
- -- Debian Python Team <team+python@tracker.debian.org>  Fri, 17 Jun 2022 13:18:04 +0800
+ -- Alexandre Detiste <tchet@debian.org>  Mon, 27 Jan 2025 13:37:42 +0100
+
+python-kubernetes (30.1.0-1) unstable; urgency=medium
+
+  * Team Upload
+  * New upstream version 30.1.0
+  * Remove patch applied upstream
+  * Remove extraneous python3-mock build dep
+  * Use new dh-sequence-python3
+  * Use the standard /usr/share/dpkg/pkg-info.mk
+    instead of calling dpkg-parsechangelog
+
+ -- Alexandre Detiste <tchet@debian.org>  Sat, 08 Jun 2024 11:03:52 +0200
+
+python-kubernetes (29.0.0-1) unstable; urgency=medium
+
+  * Team Upload
+  * New upstream version 29.0.0 (Closes: #1058350)
+  * remove obsolete python3-nose build dependency (Closes: #1018523)
+  * remove obsolete python3-randomize build dependency
+  * refresh patch
+
+ -- Alexandre Detiste <tchet@debian.org>  Fri, 03 May 2024 13:50:22 +0200
+
+python-kubernetes (26.1.0-3) unstable; urgency=medium
+
+  * Re-upload source-only.
+
+ -- Thomas Goirand <zigo@debian.org>  Thu, 18 Apr 2024 11:59:26 +0200
+
+python-kubernetes (26.1.0-2) unstable; urgency=medium
+
+  * Uploading to unstable.
+  * Add fix-assertEqual.patch.
+
+ -- Thomas Goirand <zigo@debian.org>  Thu, 04 Apr 2024 08:47:06 +0200
+
+python-kubernetes (26.1.0-1) experimental; urgency=medium
+
+  * New upstream release.
+  * Cleans better.
+
+ -- Thomas Goirand <zigo@debian.org>  Tue, 29 Aug 2023 16:52:56 +0200
+
+python-kubernetes (22.6.0-2) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * Bump debhelper from old 12 to 13.
+  * Update standards version to 4.6.0, no changes needed.
+
+ -- Jelmer Vernooĳ <jelmer@debian.org>  Mon, 17 Oct 2022 03:23:56 +0100
+
+python-kubernetes (22.6.0-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Increase python3-yaml required version.
+
+ -- Thomas Goirand <zigo@debian.org>  Thu, 25 Aug 2022 16:13:29 +0200
 
 python-kubernetes (12.0.1-1) unstable; urgency=medium
 
   [ Ondřej Nový ]
-  * Bump Standards-Version to 4.4.1 .
+  * Bump Standards-Version to 4.4.1.
   * d/control: Update Maintainer field with new Debian Python Team
     contact address.
   * d/control: Update Vcs-* fields with new Debian Python Team Salsa

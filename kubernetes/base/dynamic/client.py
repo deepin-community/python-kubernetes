@@ -98,7 +98,12 @@ class DynamicClient(object):
         return namespace
 
     def serialize_body(self, body):
-        if hasattr(body, 'to_dict'):
+        """Serialize body to raw dict so apiserver can handle it
+
+        :param body: kubernetes resource body, current support: Union[Dict, ResourceInstance]
+        """
+        # This should match any `ResourceInstance` instances
+        if callable(getattr(body, 'to_dict', None)):
             return body.to_dict()
         return body or {}
 
@@ -144,7 +149,21 @@ class DynamicClient(object):
 
         return self.request('patch', path, body=body, content_type=content_type, **kwargs)
 
-    def watch(self, resource, namespace=None, name=None, label_selector=None, field_selector=None, resource_version=None, timeout=None):
+    def server_side_apply(self, resource, body=None, name=None, namespace=None, force_conflicts=None, **kwargs):
+        body = self.serialize_body(body)
+        name = name or body.get('metadata', {}).get('name')
+        if not name:
+            raise ValueError("name is required to patch {}.{}".format(resource.group_version, resource.kind))
+        if resource.namespaced:
+            namespace = self.ensure_namespace(resource, namespace, body)
+
+        # force content type to 'application/apply-patch+yaml'
+        kwargs.update({'content_type': 'application/apply-patch+yaml'})
+        path = resource.path(name=name, namespace=namespace)
+
+        return self.request('patch', path, body=body, force_conflicts=force_conflicts, **kwargs)
+
+    def watch(self, resource, namespace=None, name=None, label_selector=None, field_selector=None, resource_version=None, timeout=None, watcher=None):
         """
         Stream events for a resource from the Kubernetes API
 
@@ -156,6 +175,7 @@ class DynamicClient(object):
         :param resource_version: The version with which to filter results. Only events with
                                  a resource_version greater than this value will be returned
         :param timeout: The amount of time in seconds to wait before terminating the stream
+        :param watcher: The Watcher object that will be used to stream the resource
 
         :return: Event object with these keys:
                    'type': The type of event such as "ADDED", "DELETED", etc.
@@ -164,17 +184,24 @@ class DynamicClient(object):
 
         Example:
             client = DynamicClient(k8s_client)
+            watcher = watch.Watch()
             v1_pods = client.resources.get(api_version='v1', kind='Pod')
 
-            for e in v1_pods.watch(resource_version=0, namespace=default, timeout=5):
+            for e in v1_pods.watch(resource_version=0, namespace=default, timeout=5, watcher=watcher):
                 print(e['type'])
                 print(e['object'].metadata)
+                # If you want to gracefully stop the stream watcher
+                watcher.stop()
         """
-        watcher = watch.Watch()
+        if not watcher: watcher = watch.Watch()
+
+        # Use field selector to query for named instance so the watch parameter is handled properly.
+        if name:
+            field_selector = f"metadata.name={name}"
+
         for event in watcher.stream(
             resource.get,
             namespace=namespace,
-            name=name,
             field_selector=field_selector,
             label_selector=label_selector,
             resource_version=resource_version,
@@ -215,15 +242,24 @@ class DynamicClient(object):
             query_params.append(('propagationPolicy', params['propagation_policy']))
         if params.get('orphan_dependents') is not None:
             query_params.append(('orphanDependents', params['orphan_dependents']))
+        if params.get('dry_run') is not None:
+            query_params.append(('dryRun', params['dry_run']))
+        if params.get('field_manager') is not None:
+            query_params.append(('fieldManager', params['field_manager']))
+        if params.get('force_conflicts') is not None:
+            query_params.append(('force', params['force_conflicts']))
 
         header_params = params.get('header_params', {})
         form_params = []
         local_var_files = {}
-        # HTTP header `Accept`
-        header_params['Accept'] = self.client.select_header_accept([
-            'application/json',
-            'application/yaml',
-        ])
+
+        # Checking Accept header.
+        new_header_params = dict((key.lower(), value) for key, value in header_params.items())
+        if not 'accept' in new_header_params:
+            header_params['Accept'] = self.client.select_header_accept([
+                'application/json',
+                'application/yaml',
+            ])
 
         # HTTP header `Content-Type`
         if params.get('content_type'):
@@ -234,7 +270,7 @@ class DynamicClient(object):
         # Authentication setting
         auth_settings = ['BearerToken']
 
-        return self.client.call_api(
+        api_response = self.client.call_api(
             path,
             method.upper(),
             path_params,
@@ -246,8 +282,13 @@ class DynamicClient(object):
             files=local_var_files,
             auth_settings=auth_settings,
             _preload_content=False,
-            _return_http_data_only=params.get('_return_http_data_only', True)
+            _return_http_data_only=params.get('_return_http_data_only', True),
+            _request_timeout=params.get('_request_timeout')
         )
+        if params.get('async_req'):
+            return api_response.get()
+        else:
+            return api_response
 
     def validate(self, definition, version=None, strict=False):
         """validate checks a kubernetes resource definition

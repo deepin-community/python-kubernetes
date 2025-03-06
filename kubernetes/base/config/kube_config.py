@@ -60,7 +60,7 @@ def _cleanup_temp_files():
     _temp_files = {}
 
 
-def _create_temp_file_with_content(content):
+def _create_temp_file_with_content(content, temp_file_path=None):
     if len(_temp_files) == 0:
         atexit.register(_cleanup_temp_files)
     # Because we may change context several times, try to remember files we
@@ -68,7 +68,10 @@ def _create_temp_file_with_content(content):
     content_key = str(content)
     if content_key in _temp_files:
         return _temp_files[content_key]
-    _, name = tempfile.mkstemp()
+    if temp_file_path and not os.path.isdir(temp_file_path):
+        os.makedirs(name=temp_file_path)
+    fd, name = tempfile.mkstemp(dir=temp_file_path)
+    os.close(fd)
     _temp_files[content_key] = name
     with open(name, 'wb') as fd:
         fd.write(content.encode() if isinstance(content, str) else content)
@@ -77,7 +80,7 @@ def _create_temp_file_with_content(content):
 
 def _is_expired(expiry):
     return ((parse_rfc3339(expiry) - EXPIRY_SKEW_PREVENTION_DELAY) <=
-            datetime.datetime.utcnow().replace(tzinfo=UTC))
+            datetime.datetime.now(tz=UTC))
 
 
 class FileOrData(object):
@@ -91,12 +94,14 @@ class FileOrData(object):
      result in base64 encode of the file content after read."""
 
     def __init__(self, obj, file_key_name, data_key_name=None,
-                 file_base_path="", base64_file_content=True):
+                 file_base_path="", base64_file_content=True,
+                 temp_file_path=None):
         if not data_key_name:
             data_key_name = file_key_name + "-data"
         self._file = None
         self._data = None
         self._base64_file_content = base64_file_content
+        self._temp_file_path = temp_file_path
         if not obj:
             return
         if data_key_name in obj:
@@ -116,11 +121,12 @@ class FileOrData(object):
                 else:
                     content = self._data
                 self._file = _create_temp_file_with_content(
-                    base64.standard_b64decode(content))
+                    base64.standard_b64decode(content), self._temp_file_path)
             else:
-                self._file = _create_temp_file_with_content(self._data)
+                self._file = _create_temp_file_with_content(
+                    self._data, self._temp_file_path)
         if self._file and not os.path.isfile(self._file):
-            raise ConfigException("File does not exists: %s" % self._file)
+            raise ConfigException("File does not exist: %s" % self._file)
         return self._file
 
     def as_data(self):
@@ -182,7 +188,8 @@ class KubeConfigLoader(object):
     def __init__(self, config_dict, active_context=None,
                  get_google_credentials=None,
                  config_base_path="",
-                 config_persister=None):
+                 config_persister=None,
+                 temp_file_path=None):
 
         if config_dict is None:
             raise ConfigException(
@@ -199,6 +206,7 @@ class KubeConfigLoader(object):
         self.set_active_context(active_context)
         self._config_base_path = config_base_path
         self._config_persister = config_persister
+        self._temp_file_path = temp_file_path
 
         def _refresh_credentials_with_cmd_path():
             config = self._user['auth-provider']['config']
@@ -352,6 +360,8 @@ class KubeConfigLoader(object):
             self._refresh_gcp_token()
 
         self.token = "Bearer %s" % provider['config']['access-token']
+        if 'expiry' in provider['config']:
+            self.expiry = parse_rfc3339(provider['config']['expiry'])
         return self.token
 
     def _refresh_gcp_token(self):
@@ -388,7 +398,7 @@ class KubeConfigLoader(object):
 
         if PY3:
             jwt_attributes = json.loads(
-                base64.b64decode(parts[1] + padding).decode('utf-8')
+                base64.urlsafe_b64decode(parts[1] + padding).decode('utf-8')
             )
         else:
             jwt_attributes = json.loads(
@@ -428,6 +438,9 @@ class KubeConfigLoader(object):
                 fh.write(cert)
 
             config.ssl_ca_cert = ca_cert.name
+
+        elif 'idp-certificate-authority' in provider['config']:
+            config.ssl_ca_cert = provider['config']['idp-certificate-authority']
 
         else:
             config.verify_ssl = False
@@ -473,32 +486,36 @@ class KubeConfigLoader(object):
         if 'exec' not in self._user:
             return
         try:
-            status = ExecProvider(self._user['exec']).run()
+            base_path = self._get_base_path(self._cluster.path)
+            status = ExecProvider(self._user['exec'], base_path).run()
             if 'token' in status:
                 self.token = "Bearer %s" % status['token']
-                return True
-            if 'clientCertificateData' in status:
+            elif 'clientCertificateData' in status:
                 # https://kubernetes.io/docs/reference/access-authn-authz/authentication/#input-and-output-formats
                 # Plugin has provided certificates instead of a token.
                 if 'clientKeyData' not in status:
                     logging.error('exec: missing clientKeyData field in '
                                   'plugin output')
                     return None
-                base_path = self._get_base_path(self._cluster.path)
                 self.cert_file = FileOrData(
                     status, None,
                     data_key_name='clientCertificateData',
                     file_base_path=base_path,
-                    base64_file_content=False).as_file()
+                    base64_file_content=False,
+                    temp_file_path=self._temp_file_path).as_file()
                 self.key_file = FileOrData(
                     status, None,
                     data_key_name='clientKeyData',
                     file_base_path=base_path,
-                    base64_file_content=False).as_file()
-                return True
-            logging.error('exec: missing token or clientCertificateData field '
-                          'in plugin output')
-            return None
+                    base64_file_content=False,
+                    temp_file_path=self._temp_file_path).as_file()
+            else:
+                logging.error('exec: missing token or clientCertificateData '
+                              'field in plugin output')
+                return None
+            if 'expirationTimestamp' in status:
+                self.expiry = parse_rfc3339(status['expirationTimestamp'])
+            return True
         except Exception as e:
             logging.error(str(e))
 
@@ -507,7 +524,8 @@ class KubeConfigLoader(object):
         token = FileOrData(
             self._user, 'tokenFile', 'token',
             file_base_path=base_path,
-            base64_file_content=False).as_data()
+            base64_file_content=False,
+            temp_file_path=self._temp_file_path).as_data()
         if token:
             self.token = "Bearer %s" % token
             return True
@@ -533,41 +551,36 @@ class KubeConfigLoader(object):
                 base_path = self._get_base_path(self._cluster.path)
                 self.ssl_ca_cert = FileOrData(
                     self._cluster, 'certificate-authority',
-                    file_base_path=base_path).as_file()
+                    file_base_path=base_path,
+                    temp_file_path=self._temp_file_path).as_file()
                 if 'cert_file' not in self.__dict__:
                     # cert_file could have been provided by
                     # _load_from_exec_plugin; only load from the _user
                     # section if we need it.
                     self.cert_file = FileOrData(
                         self._user, 'client-certificate',
-                        file_base_path=base_path).as_file()
+                        file_base_path=base_path,
+                        temp_file_path=self._temp_file_path).as_file()
                     self.key_file = FileOrData(
                         self._user, 'client-key',
-                        file_base_path=base_path).as_file()
+                        file_base_path=base_path,
+                        temp_file_path=self._temp_file_path).as_file()
         if 'insecure-skip-tls-verify' in self._cluster:
             self.verify_ssl = not self._cluster['insecure-skip-tls-verify']
-
-    def _using_gcp_auth_provider(self):
-        return self._user and \
-            'auth-provider' in self._user and \
-            'name' in self._user['auth-provider'] and \
-            self._user['auth-provider']['name'] == 'gcp'
+        if 'tls-server-name' in self._cluster:
+            self.tls_server_name = self._cluster['tls-server-name']
 
     def _set_config(self, client_configuration):
-        if self._using_gcp_auth_provider():
-            # GCP auth tokens must be refreshed regularly, but swagger expects
-            # a constant token. Replace the swagger-generated client config's
-            # get_api_key_with_prefix method with our own to allow automatic
-            # token refresh.
-            def _gcp_get_api_key(*args):
-                return self._load_gcp_token(self._user['auth-provider'])
-            client_configuration.get_api_key_with_prefix = _gcp_get_api_key
         if 'token' in self.__dict__:
-            # Note: this line runs for GCP auth tokens as well, but this entry
-            # will not be updated upon GCP token refresh.
             client_configuration.api_key['authorization'] = self.token
+
+            def _refresh_api_key(client_configuration):
+                if ('expiry' in self.__dict__ and _is_expired(self.expiry)):
+                    self._load_authentication()
+                self._set_config(client_configuration)
+            client_configuration.refresh_api_key_hook = _refresh_api_key
         # copy these keys directly from self to configuration object
-        keys = ['host', 'ssl_ca_cert', 'cert_file', 'key_file', 'verify_ssl']
+        keys = ['host', 'ssl_ca_cert', 'cert_file', 'key_file', 'verify_ssl','tls_server_name']
         for key in keys:
             if key in self.__dict__:
                 setattr(client_configuration, key, getattr(self, key))
@@ -654,7 +667,7 @@ class ConfigNode(object):
 class KubeConfigMerger:
 
     """Reads and merges configuration from one or more kube-config's.
-    The propery `config` can be passed to the KubeConfigLoader as config_dict.
+    The property `config` can be passed to the KubeConfigLoader as config_dict.
 
     It uses a path attribute from ConfigNode to store the path to kubeconfig.
     This path is required to load certs from relative paths.
@@ -682,6 +695,9 @@ class KubeConfigMerger:
         else:
             config = yaml.safe_load(string.read())
 
+        if config is None:
+            raise ConfigException(
+                'Invalid kube-config.')
         if self.config_merged is None:
             self.config_merged = copy.deepcopy(config)
         # doesn't need to do any further merging
@@ -699,6 +715,11 @@ class KubeConfigMerger:
         with open(path) as f:
             config = yaml.safe_load(f)
 
+        if config is None:
+            raise ConfigException(
+                'Invalid kube-config. '
+                '%s file is empty' % path)
+
         if self.config_merged is None:
             config_merged = copy.deepcopy(config)
             for item in ('clusters', 'contexts', 'users'):
@@ -706,6 +727,10 @@ class KubeConfigMerger:
             self.config_merged = ConfigNode(path, config_merged, path)
         for item in ('clusters', 'contexts', 'users'):
             self._merge(item, config.get(item, []) or [], path)
+
+        if 'current-context' in config:
+            self.config_merged.value['current-context'] = config['current-context']
+
         self.config_files[path] = config
 
     def _merge(self, item, add_cfg, path):
@@ -773,7 +798,8 @@ def list_kube_config_contexts(config_file=None):
 
 def load_kube_config(config_file=None, context=None,
                      client_configuration=None,
-                     persist_config=True):
+                     persist_config=True,
+                     temp_file_path=None):
     """Loads authentication and cluster information from kube-config file
     and stores them in kubernetes.client.configuration.
 
@@ -784,6 +810,7 @@ def load_kube_config(config_file=None, context=None,
         set configs to.
     :param persist_config: If True, config file will be updated when changed
         (e.g GCP token refresh).
+    :param temp_file_path: store temp files path.
     """
 
     if config_file is None:
@@ -791,7 +818,8 @@ def load_kube_config(config_file=None, context=None,
 
     loader = _get_kube_config_loader(
         filename=config_file, active_context=context,
-        persist_config=persist_config)
+        persist_config=persist_config,
+        temp_file_path=temp_file_path)
 
     if client_configuration is None:
         config = type.__call__(Configuration)
@@ -803,7 +831,8 @@ def load_kube_config(config_file=None, context=None,
 
 def load_kube_config_from_dict(config_dict, context=None,
                                client_configuration=None,
-                               persist_config=True):
+                               persist_config=True,
+                               temp_file_path=None):
     """Loads authentication and cluster information from config_dict file
     and stores them in kubernetes.client.configuration.
 
@@ -814,8 +843,8 @@ def load_kube_config_from_dict(config_dict, context=None,
         set configs to.
     :param persist_config: If True, config file will be updated when changed
         (e.g GCP token refresh).
+    :param temp_file_path: store temp files path.
     """
-
     if config_dict is None:
         raise ConfigException(
             'Invalid kube-config dict. '
@@ -823,7 +852,8 @@ def load_kube_config_from_dict(config_dict, context=None,
 
     loader = _get_kube_config_loader(
         config_dict=config_dict, active_context=context,
-        persist_config=persist_config)
+        persist_config=persist_config,
+        temp_file_path=temp_file_path)
 
     if client_configuration is None:
         config = type.__call__(Configuration)
@@ -836,14 +866,36 @@ def load_kube_config_from_dict(config_dict, context=None,
 def new_client_from_config(
         config_file=None,
         context=None,
-        persist_config=True):
+        persist_config=True,
+        client_configuration=None):
     """
     Loads configuration the same as load_kube_config but returns an ApiClient
     to be used with any API object. This will allow the caller to concurrently
     talk with multiple clusters.
     """
-    client_config = type.__call__(Configuration)
+    if client_configuration is None:
+        client_configuration = type.__call__(Configuration)
     load_kube_config(config_file=config_file, context=context,
-                     client_configuration=client_config,
+                     client_configuration=client_configuration,
                      persist_config=persist_config)
-    return ApiClient(configuration=client_config)
+    return ApiClient(configuration=client_configuration)
+
+
+def new_client_from_config_dict(
+        config_dict=None,
+        context=None,
+        persist_config=True,
+        temp_file_path=None,
+        client_configuration=None):
+    """
+    Loads configuration the same as load_kube_config_from_dict but returns an ApiClient
+    to be used with any API object. This will allow the caller to concurrently
+    talk with multiple clusters.
+    """
+    if client_configuration is None:
+        client_configuration = type.__call__(Configuration)
+    load_kube_config_from_dict(config_dict=config_dict, context=context,
+                               client_configuration=client_configuration,
+                               persist_config=persist_config,
+                               temp_file_path=temp_file_path)
+    return ApiClient(configuration=client_configuration)

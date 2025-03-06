@@ -18,9 +18,10 @@ Allows you to pick a context and then lists all pods in the chosen context.
 Please install the pick library before running this example.
 """
 
+from pick import pick  # install pick using `pip install pick`
+
 from kubernetes import client, config
 from kubernetes.client import configuration
-from pick import pick  # install pick using `pip install pick`
 
 
 def main():
@@ -36,7 +37,7 @@ def main():
     # utility
     config.load_kube_config(context=option)
 
-    print("Active host is %s" % configuration.Configuration().host)
+    print(f"Active host is {configuration.Configuration().host}")
 
     v1 = client.CoreV1Api()
     print("Listing pods with their IPs:")
